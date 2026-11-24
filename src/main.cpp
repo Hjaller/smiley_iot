@@ -26,8 +26,21 @@
 // ---------------------------------------------------------------------------
 // Indstillinger
 // ---------------------------------------------------------------------------
-const char*    MQTT_VAERT = "wilsons.local";   // værtsnavn (ikke IP) - bruges til certifikat-tjek
-const uint16_t MQTT_PORT  = 8883;              // TLS + login (1883 er ukrypteret - bruges IKKE)
+// *** SIKKERHED ***
+//   1 = TLS-kryptering + brugernavn/kode, port 8883  (KRAV i opgaven)
+//   0 = MIDLERTIDIGT: ukrypteret, uden login, port 1883
+#ifndef BRUG_TLS
+#define BRUG_TLS 0
+#endif
+
+#if BRUG_TLS
+const uint16_t MQTT_PORT = 8883;
+#else
+#warning "BRUG_TLS=0: MQTT er UKRYPTERET og uden login - husk at skifte tilbage til 1!"
+const uint16_t MQTT_PORT = 1883;
+#endif
+
+const char* MQTT_VAERT = "wilsons.local";   // værtsnavn (ikke IP) - bruges til certifikat-tjek
 
 const char* TIDSZONE     = "CET-1CEST,M3.5.0,M10.5.0/3";   // Danmark inkl. sommertid
 const char* NTP_SERVER_1 = "pool.ntp.org";
@@ -68,8 +81,12 @@ RTC_DATA_ATTR uint32_t forrigeVaagenMs = 0;   // til strømforbrugs-analysen
 // ---------------------------------------------------------------------------
 // Tilstand
 // ---------------------------------------------------------------------------
-WiFiClientSecure tls;
-PubSubClient     mqtt(tls);
+#if BRUG_TLS
+WiFiClientSecure netKlient;   // TLS
+#else
+WiFiClient       netKlient;   // ukrypteret (midlertidigt)
+#endif
+PubSubClient     mqtt(netKlient);
 
 char klientId[48];
 char topicTryk[96];
@@ -212,9 +229,10 @@ void sendStatus() {
   char payload[256];
   snprintf(payload, sizeof payload,
            "{\"enhed\":\"%s\",\"haendelse\":\"%s\",\"tid\":\"%s\",\"boot\":%lu,\"rssi\":%d,"
-           "\"koe\":%d,\"forrige_vaagen_ms\":%lu,\"ntp_synk\":%s}",
+           "\"koe\":%d,\"forrige_vaagen_ms\":%lu,\"ntp_synk\":%s,\"tls\":%s}",
            klientId, statusHaendelse, tid, (unsigned long)bootNr, WiFi.RSSI(),
-           koeAntal, (unsigned long)forrigeVaagenMs, ntpSynk ? "true" : "false");
+           koeAntal, (unsigned long)forrigeVaagenMs, ntpSynk ? "true" : "false",
+           BRUG_TLS ? "true" : "false");
   if (mqtt.publish(topicStatus, payload)) {
     statusAfventer = false;
     LOG("Status sendt -> %s", payload);
@@ -238,14 +256,23 @@ void haandterNetvaerk() {
   if (!mqtt.connected()) {
     if (sidsteMqttForsoeg != 0 && millis() - sidsteMqttForsoeg < MQTT_GENFORSOEG_MS) return;
     sidsteMqttForsoeg = millis();
-    LOG("Forbinder til MQTT %s:%u (TLS) som %s ...", MQTT_VAERT, MQTT_PORT, klientId);
+#if BRUG_TLS
+    LOG("Forbinder til MQTT %s:%u (TLS + login) som %s ...", MQTT_VAERT, MQTT_PORT, klientId);
     if (!mqtt.connect(klientId, MQTT_USER, MQTT_PASSWORD)) {
       char fejl[128] = "";
-      tls.lastError(fejl, sizeof fejl);
+      netKlient.lastError(fejl, sizeof fejl);
       LOG("MQTT fejl rc=%d, TLS: %s", mqtt.state(), fejl);
       return;
     }
     LOG("MQTT forbundet (TLS verificeret mod CA)");
+#else
+    LOG("Forbinder til MQTT %s:%u (UKRYPTERET, uden login) som %s ...", MQTT_VAERT, MQTT_PORT, klientId);
+    if (!mqtt.connect(klientId)) {
+      LOG("MQTT fejl rc=%d", mqtt.state());
+      return;
+    }
+    LOG("MQTT forbundet (UKRYPTERET)");
+#endif
   }
 
   mqtt.loop();
@@ -268,7 +295,7 @@ void gaaISoevn() {
     mqtt.loop();
     mqtt.disconnect();
   }
-  tls.stop();
+  netKlient.stop();
   delay(50);                                   // lad TCP nå at sende det sidste
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -350,7 +377,9 @@ void setup() {
   snprintf(topicTryk,   sizeof topicTryk,   "elever/%s/smiley/tryk",   MQTT_USER);
   snprintf(topicStatus, sizeof topicStatus, "elever/%s/smiley/status", MQTT_USER);
 
-  tls.setCACert(CA_CERT);                      // ALDRIG setInsecure()
+#if BRUG_TLS
+  netKlient.setCACert(CA_CERT);                // ALDRIG setInsecure()
+#endif
   mqtt.setServer(MQTT_VAERT, MQTT_PORT);
   mqtt.setBufferSize(512);
   sntp_set_time_sync_notification_cb(ntpCallback);
