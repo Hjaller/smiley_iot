@@ -4,5 +4,5 @@
 .vscode/launch.json
 .vscode/ipch
 
-# Hemmeligheder - maa ALDRIG committes
+# Secrets - must NEVER be committed
 include/secrets.h

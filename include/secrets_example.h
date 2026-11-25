@@ -1,12 +1,12 @@
 #pragma once
 
-// SKABELON - kopier denne fil til include/secrets.h og udfyld.
-// secrets.h staar i .gitignore og maa ALDRIG committes.
-// Hvis den kommer i git ved et uheld:  git rm --cached include/secrets.h
-// og bed laereren om en ny MQTT-kode.
+// TEMPLATE - copy this file to include/secrets.h and fill it in.
+// secrets.h is in .gitignore and must NEVER be committed.
+// If it ends up in git by accident:  git rm --cached include/secrets.h
+// and ask the teacher for a new MQTT password.
 
-#define WIFI_SSID      "klasselokalets-2.4GHz-net"
-#define WIFI_PASSWORD  "wifi-kode"
+#define WIFI_SSID      "classroom-2.4GHz-network"
+#define WIFI_PASSWORD  "wifi-password"
 
-#define MQTT_USER      "dit-brugernavn"     // udleveret af laereren
-#define MQTT_PASSWORD  "din-mqtt-kode"
+#define MQTT_USER      "your-username"     // issued by the teacher
+#define MQTT_PASSWORD  "your-mqtt-password"

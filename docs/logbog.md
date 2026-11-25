@@ -1,66 +1,71 @@
 # Logbog – Smiley feedback-panel
 
-**Fag:** IoT II (FAG 17682)
-**Gruppe:** Hjalte
-**Repo:** https://github.com/Hjaller/smiley_iot
+**Fag:** IoT II (FAG 17682) · **Gruppe:** Hjalte · **Repo:** https://github.com/Hjaller/smiley_iot
 
-Hvert gruppemedlem skriver mindst én indførsel **hver dag** og committer den samme dag.
-Nyeste dag øverst.
+Kort overblik over hver dag. Detaljer, målinger og tests står i [portfolio.md](portfolio.md) (kort udgave: [portfolio_kort.md](portfolio_kort.md)).
+Hvert gruppemedlem skriver mindst én indførsel hver dag og committer den samme dag. Nyeste dag øverst.
 
 ---
 
-## Skabelon (kopiér til ny dag)
+## 2026-11-25 – Hjalte
+
+**Lavet**
+- Fået MQTT-login af læreren og slået TLS til. Det virker mod brokeren.
+- Målt tider med TLS: handshaken tager ca. 0,7 s, men tiden fra tryk til afsendelse er uændret (ca. 4 s).
+- Målt, at ESP32's ur går ca. 1,3 % for hurtigt under deep sleep.
+- Beregnet strømforbrug ud fra databladet og valgt inaktiv-tid (10 s) og rutine-vågning (hver 6. time).
+- Kørt tests af rutine-vågning, TLS, forkert kode, langsomt net, holdt knap og den nye inaktiv-tid. Alle bestået efter rettelser.
+- Oversat koden og JSON-felterne til engelsk.
+- Taget foto af opstillingen og screenshot af weblog'en til portfolioen.
+
+**Ændret**
+- Knapper og lås kører nu uafhængigt af netværket, så tryk ikke går tabt, når forbindelsen hænger.
+- Forkert login prøves kun én gang pr. vågning.
+- Ventetid på NTP hævet fra 4 til 17 s, og tryk sendes ikke længere uden tidsstempel.
+- Inaktiv-tid før deep sleep sat ned fra 30 til 10 s.
+
+**Problemer**
+- NTP er ofte langsom (op til ca. 17 s).
+- Test 10 (intet WiFi) kunne ikke laves, da vi ikke kan komme uden for WiFi-rækkevidde.
+
+**Mangler**
+- Commit og give læreren adgang til repoet.
+
+---
+
+## 2026-11-24 – Hjalte
+
+**Lavet**
+- Læst opgaven og siden om den lokale MQTT-server.
+- Bygget enheden på breadboard: ESP32, 4 knapper og 4 LED'er. Testet, at alt virker.
+- Skrevet firmwaren (med hjælp fra AI): debounce, 7 s lås, WiFi, NTP, MQTT med JSON og deep sleep.
+- Testet på boardet uden TLS: tryk når frem til brokeren, og deep sleep virker.
+- Oprettet logbog og portfolio.
+
+**Ændret**
+- TLS midlertidigt slået fra, fordi vi endnu ikke havde login.
+
+**Mangler**
+- Login fra læreren, så TLS kan testes.
+
+---
+
+<details>
+<summary>Skabelon til ny dag</summary>
 
 ```markdown
-## ÅÅÅÅ-MM-DD
+## ÅÅÅÅ-MM-DD – Navn
 
-### Navn
-**Lavet i dag**
+**Lavet**
 -
 
-**Problemer / udfordringer**
+**Ændret**
 -
 
-**Beslutninger (og hvorfor)**
+**Problemer**
 -
 
-**Næste skridt**
+**Mangler**
 -
 ```
-
----
-
-## 2026-11-24
-
-### Hjalte
-**Lavet i dag**
-- Læst projektopgaven og siden om den lokale MQTT-server (wilsons).
-- Bygget selve IoT-enheden på breadboard med ESP32 DevKit V1:
-  - 4 knapper (grøn, blå, gul, rød) på GPIO 32, 33, 25, 26 – koblet fra GPIO til 3V3 med pull-down-modstand til GND, så et tryk giver HIGH.
-  - 4 LED'er på GPIO 23, 22, 21, 19 – hver med 220 Ω formodstand til GND.
-  - Knapperne er valgt på RTC-GPIO'er, så de kan vække ESP32 fra deep sleep.
-- Testet hardwaren med et simpelt testprogram: hver LED lyser, mens knappen ud for den holdes nede – alle 4 virker.
-- Skrevet første udgave af firmwaren (med hjælp fra Claude Code / AI):
-  - Debounce (50 ms) og 7 sekunders lås, hvor LED'en ud for knappen lyser.
-  - WiFi, NTP-tid med dansk tidszone (inkl. sommertid).
-  - MQTT med JSON-beskeder (knap, værdi, tidsstempel) til `elever/<bruger>/smiley/tryk` og status til `.../smiley/status`.
-  - Deep sleep: vækkes af knaptryk (ext1) og af en timer for rutine-vågning.
-  - Kø i RTC-hukommelsen, så tryk ikke går tabt, hvis netværket er nede.
-- Sat TLS op: CA-certifikat (`ca.crt`) lagt ind i `include/ca_cert.h`, port 8883, brugernavn/kode i `include/secrets.h` (står i `.gitignore`).
-- Projektet kompilerer både med og uden TLS.
-- Uploadet og testet firmwaren på boardet (uden TLS, port 1883).
-
-**Problemer / udfordringer**
-- Vi har endnu ikke fået MQTT-brugernavn og -kode af læreren, så TLS-delen er ikke testet mod brokeren.
-
-**Beslutninger (og hvorfor)**
-- TLS er **midlertidigt slået fra** (`#define BRUG_TLS 0`, port 1883, uden login), så vi kan teste resten, mens vi venter på login. Skal sættes tilbage til `1` – opgaven kræver TLS.
-- Grøn = 4 (mest tilfreds) … rød = 1, så højere tal betyder større tilfredshed.
-- Tidsstemplet er tidspunktet for **trykket**, ikke for afsendelsen, og rettes efter NTP, når nettet er oppe.
-- Startværdier: 30 s inaktiv før deep sleep, rutine-vågning hver 6. time. Det er gæt, som skal bestemmes ved forsøg.
-
-**Næste skridt**
-- Få login af læreren, slå TLS til (`BRUG_TLS 1`) og teste igen på boardet.
-- Planlægge forsøg med deep sleep (tid fra opvågning til afsendelse, strømforbrug).
-- Give Søren adgang til git repo / gøre git repo public
-
+</details>

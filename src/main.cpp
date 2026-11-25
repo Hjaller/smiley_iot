@@ -4,394 +4,515 @@
 #include <PubSubClient.h>
 #include <esp_sleep.h>
 #include <esp_sntp.h>
+#include <esp_timer.h>
 #include <sys/time.h>
 #include <time.h>
 
-#include "secrets.h"   // WIFI_SSID, WIFI_PASSWORD, MQTT_USER, MQTT_PASSWORD (ikke i git)
-#include "ca_cert.h"   // CA_CERT - brokerens CA-certifikat
+#include "secrets.h"   // WIFI_SSID, WIFI_PASSWORD, MQTT_USER, MQTT_PASSWORD (not in git)
+#include "ca_cert.h"   // CA_CERT - the broker's CA certificate
 
-// Smiley feedback-panel
+// Smiley feedback panel
 //
-// Forløb:
-//   1. Knaptryk vækker ESP32 fra deep sleep (ext1). LED'en lyser straks,
-//      og trykket gemmes med tidsstempel i RTC-hukommelsen.
-//   2. WiFi -> NTP -> MQTT over TLS (port 8883, CA-tjek, brugernavn/kode).
-//   3. Trykket sendes som JSON. Panelet er låst i 7 s, mens LED'en lyser.
-//   4. Efter INAKTIV_MS uden tryk går den i deep sleep igen.
-//   5. Rutine-vågning hver RUTINE_SOVETID_S: NTP-synk + statusbesked.
+// Flow:
+//   1. A button press wakes the ESP32 from deep sleep (ext1). The LED lights up
+//      immediately and the press is stored with a timestamp in RTC memory.
+//   2. WiFi -> NTP -> MQTT over TLS (port 8883, CA check, username/password).
+//   3. The press is sent as JSON. The panel is locked for 7 s while the LED is lit.
+//   4. After IDLE_MS without presses it goes back to deep sleep.
+//   5. Routine wake-up every ROUTINE_SLEEP_S: NTP sync + status message.
 //
-// Tryk, der ikke kan sendes (fx intet net), bliver liggende i RTC-køen
-// og sendes ved næste vågning.
+// Presses that cannot be sent (e.g. no network) stay in the RTC queue
+// and are sent on the next wake-up.
 
 // ---------------------------------------------------------------------------
-// Indstillinger
+// Settings
 // ---------------------------------------------------------------------------
-// *** SIKKERHED ***
-//   1 = TLS-kryptering + brugernavn/kode, port 8883  (KRAV i opgaven)
-//   0 = MIDLERTIDIGT: ukrypteret, uden login, port 1883
-#ifndef BRUG_TLS
-#define BRUG_TLS 0
+// *** SECURITY ***
+//   1 = TLS encryption + username/password, port 8883  (REQUIRED by the assignment)
+//   0 = TEMPORARY: unencrypted, no login, port 1883
+#ifndef USE_TLS
+#define USE_TLS 1
 #endif
 
-#if BRUG_TLS
+#if USE_TLS
 const uint16_t MQTT_PORT = 8883;
 #else
-#warning "BRUG_TLS=0: MQTT er UKRYPTERET og uden login - husk at skifte tilbage til 1!"
+#warning "USE_TLS=0: MQTT is UNENCRYPTED and without login - remember to switch back to 1!"
 const uint16_t MQTT_PORT = 1883;
 #endif
 
-const char* MQTT_VAERT = "wilsons.local";   // værtsnavn (ikke IP) - bruges til certifikat-tjek
+const char* MQTT_HOST = "wilsons.local";   // host name (not IP) - used for the certificate check
 
-const char* TIDSZONE     = "CET-1CEST,M3.5.0,M10.5.0/3";   // Danmark inkl. sommertid
+const char* TIMEZONE     = "CET-1CEST,M3.5.0,M10.5.0/3";   // Denmark incl. daylight saving time
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.google.com";
 
-const uint32_t DEBOUNCE_MS        = 50;
-const uint32_t LAAS_MS            = 7000;     // spærretid efter tryk (krav: 7 s)
-const uint32_t INAKTIV_MS         = 30000;    // vågen-tid uden aktivitet før deep sleep  -> bestem ved forsøg
-const uint64_t RUTINE_SOVETID_S   = 6ULL * 3600;  // rutine-vågning (NTP + status)       -> bestem ved forsøg
-const uint32_t NET_TIMEOUT_MS     = 20000;    // opgiv net og sov (tryk bliver i køen)
-const uint32_t NTP_VENT_MS        = 4000;     // max ventetid på NTP før tryk sendes med RTC-tid
-const uint32_t MQTT_GENFORSOEG_MS = 3000;
+const uint32_t DEBOUNCE_MS     = 50;
+const uint32_t LOCK_MS         = 7000;     // lock-out after a press (required: 7 s)
+const uint32_t IDLE_MS         = 10000;    // awake time without activity before deep sleep -> determined by experiments
+const uint64_t ROUTINE_SLEEP_S = 6ULL * 3600;  // routine wake-up (NTP + status)        -> determined by experiments
+const uint32_t NET_TIMEOUT_MS  = 20000;    // give up on the network and sleep (presses stay in the queue)
+const uint32_t NTP_WAIT_MS     = 17000;    // max wait (from WiFi up) for NTP before a press is sent with RTC time.
+                                           // Awake >= LOCK_MS + IDLE_MS = 17 s after a press anyway, so waiting is ~free.
+                                           // RTC drift ~1.3 % -> up to ~5 min error after 6 h sleep without NTP.
+const uint32_t MQTT_RETRY_MS   = 3000;
+const uint32_t TLS_TIMEOUT_MS  = 8000;     // max time for TCP connect (default 30 s). DNS lookup is NOT covered (~15 s if it fails)
 
-//                         grøn  blå  gul  rød
-const int   KNAP_PIN[4] = {  32,  33,  25,  26 };   // alle er RTC-GPIO -> kan vække fra deep sleep
-const int   LED_PIN[4]  = {  23,  22,  21,  19 };
-const char* NAVN[4]     = { "groen", "blaa", "gul", "roed" };
-const int   VAERDI[4]   = {   4,     3,     2,     1   };  // 4 = mest tilfreds
+//                          green blue yellow red
+const int   BUTTON_PIN[4] = {  32,  33,   25,  26 };   // all are RTC GPIOs -> can wake from deep sleep
+const int   LED_PIN[4]    = {  23,  22,   21,  19 };
+const char* NAME[4]       = { "green", "blue", "yellow", "red" };
+const int   VALUE[4]      = {    4,      3,      2,       1  };  // 4 = most satisfied
 
 #define LOG(fmt, ...) Serial.printf("[%7lu ms] " fmt "\n", (unsigned long)millis(), ##__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// RTC-hukommelse - overlever deep sleep (nulstilles ved strøm-til/reset)
+// RTC memory - survives deep sleep (cleared on power-on/reset)
 // ---------------------------------------------------------------------------
-struct Tryk {
-  uint8_t  knap;
-  uint32_t session;        // bootNr da trykket skete
-  uint32_t millisVedTryk;  // til NTP-korrektion af tidsstemplet i samme session
-  int64_t  epochMs;        // tid ved tryk (0 = ukendt)
+struct Press {
+  uint8_t  button;
+  uint32_t session;        // bootCount when the press happened
+  uint32_t millisAtPress;  // for NTP correction of the timestamp in the same session
+  int64_t  epochMs;        // time of the press (0 = unknown)
+  bool     ntpCorrected;   // epochMs has been corrected by NTP (before deep sleep)
 };
 
-const int KOE_MAX = 32;
-RTC_DATA_ATTR Tryk     koe[KOE_MAX];
-RTC_DATA_ATTR int      koeAntal        = 0;
-RTC_DATA_ATTR uint32_t bootNr          = 0;
-RTC_DATA_ATTR uint32_t forrigeVaagenMs = 0;   // til strømforbrugs-analysen
+const int QUEUE_MAX = 32;
+RTC_DATA_ATTR Press    queue[QUEUE_MAX];
+RTC_DATA_ATTR int      queueCount    = 0;
+RTC_DATA_ATTR uint32_t bootCount     = 0;
+RTC_DATA_ATTR uint32_t prevAwakeMs   = 0;      // for the power consumption analysis
+RTC_DATA_ATTR int64_t  sleepStartMs  = 0;      // clock time when going to deep sleep (drift measurement)
+RTC_DATA_ATTR bool     sleepStartNtp = false;  // was the clock NTP-synced when going to sleep?
 
 // ---------------------------------------------------------------------------
-// Tilstand
+// State
 // ---------------------------------------------------------------------------
-#if BRUG_TLS
-WiFiClientSecure netKlient;   // TLS
+#if USE_TLS
+WiFiClientSecure netClient;   // TLS
 #else
-WiFiClient       netKlient;   // ukrypteret (midlertidigt)
+WiFiClient       netClient;   // unencrypted (temporary)
 #endif
-PubSubClient     mqtt(netKlient);
+PubSubClient     mqtt(netClient);
 
-char klientId[48];
-char topicTryk[96];
+char clientId[48];
+char topicPress[96];
 char topicStatus[96];
 
-volatile bool ntpSynk = false;
-bool ntpStartet       = false;
-uint32_t wifiForbundetMs  = 0;
-uint32_t sidsteMqttForsoeg = 0;
+volatile bool ntpSynced = false;
+bool ntpStarted         = false;
+bool loginRejected      = false;   // rc=4/5: give up MQTT for the rest of this wake-up
+uint32_t wifiConnectedMs = 0;
+uint32_t lastMqttAttempt = 0;
 
-bool rutineVaagning = false;
-bool statusAfventer = false;
-const char* statusHaendelse = "";
+bool routineWake   = false;
+bool statusPending = false;
+const char* statusEvent = "";
 
-bool     laast = false;
-int      aktivLed = -1;
-uint32_t laasStart = 0;
-uint32_t sidsteAktivitet = 0;
+// Buttons and lock run in esp_timer callbacks (the esp_timer task), NOT in loop().
+// DNS + TLS can block loop() for up to ~15 s (test 15), but buttons are still read
+// every 5 ms and the LED turns off after exactly 7 s.
+const uint32_t BUTTON_POLL_MS = 5;
+esp_timer_handle_t lockTimer, buttonTimer;
+volatile bool locked       = false;
+volatile int  activeLed    = -1;
+volatile uint32_t lastActivity = 0;
+portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;   // queue is shared by esp_timer task and loop()
 
-int      raa[4], stabil[4];
-uint32_t sidsteSkift[4];
+int64_t  rtcAtStartMs  = 0;                   // clock time at program start (before NTP)
+uint32_t millisAtStart = 0;
+bool     driftLogged   = false;
+
+volatile int raw[4], stable[4];
+uint32_t lastChange[4];
 
 // ---------------------------------------------------------------------------
-// Tid
+// Time
 // ---------------------------------------------------------------------------
-int64_t nuMs() {
+int64_t nowMs() {
   struct timeval tv;
   gettimeofday(&tv, nullptr);
   return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
-bool tidGyldig() { return time(nullptr) > 1700000000; }   // efter nov. 2023 = sat
+bool timeValid() { return time(nullptr) > 1700000000; }   // after Nov 2023 = set
 
-// ISO 8601 med millisekunder og tidszone, fx 2026-11-24T10:15:03.123+01:00
-void formaterTid(int64_t ms, char* buf, size_t len) {
+// ISO 8601 with milliseconds and time zone, e.g. 2026-11-24T10:15:03.123+01:00
+void formatTime(int64_t ms, char* buf, size_t len) {
   time_t s = ms / 1000;
   struct tm t;
   localtime_r(&s, &t);
-  char dato[24], zone[8];
-  strftime(dato, sizeof dato, "%Y-%m-%dT%H:%M:%S", &t);
+  char date[24], zone[8];
+  strftime(date, sizeof date, "%Y-%m-%dT%H:%M:%S", &t);
   strftime(zone, sizeof zone, "%z", &t);                 // +0100
-  snprintf(buf, len, "%s.%03d%.3s:%s", dato, (int)(ms % 1000), zone, zone + 3);
+  snprintf(buf, len, "%s.%03d%.3s:%s", date, (int)(ms % 1000), zone, zone + 3);
 }
 
-void ntpCallback(struct timeval*) { ntpSynk = true; }
+void ntpCallback(struct timeval*) { ntpSynced = true; }
 
-// ---------------------------------------------------------------------------
-// Knapper, debounce og lås
-// ---------------------------------------------------------------------------
-void registrerTryk(int i) {
-  laast = true;
-  laasStart = millis();
-  aktivLed = i;
-  sidsteAktivitet = millis();
-  rutineVaagning = false;   // nu er det en "rigtig" vågning
-  for (int j = 0; j < 4; j++) digitalWrite(LED_PIN[j], j == i ? HIGH : LOW);
-
-  if (koeAntal == KOE_MAX) {          // fuld kø: kassér ældste
-    memmove(&koe[0], &koe[1], sizeof(Tryk) * (KOE_MAX - 1));
-    koeAntal--;
-    LOG("Koe fuld - aeldste tryk kasseret");
+// First NTP sync in a wake-up: how much did the RTC clock drift during deep sleep?
+void logDrift() {
+  if (!ntpSynced || driftLogged) return;
+  driftLogged = true;
+  int64_t  now   = nowMs();
+  uint32_t since = millis() - millisAtStart;
+  if (rtcAtStartMs == 0) {
+    LOG("NTP sync - clock was not set before");
+    return;
   }
-  koe[koeAntal++] = { (uint8_t)i, bootNr, millis(), tidGyldig() ? nuMs() : 0 };
-  LOG("Tryk: %s (vaerdi %d) - laast i %lu s", NAVN[i], VAERDI[i], LAAS_MS / 1000);
+  int64_t drift = rtcAtStartMs + since - now;     // + = RTC clock ran fast
+  if (sleepStartMs > 0) {
+    double sleepS = (double)(now - since - sleepStartMs) / 1000.0;
+    LOG("NTP sync - RTC clock was off by %+lld ms after %.1f s deep sleep (%.2f %%)%s",
+        (long long)drift, sleepS, sleepS > 0 ? 100.0 * drift / (sleepS * 1000.0) : 0.0,
+        sleepStartNtp ? "" : " [uncertain: clock was not NTP-synced when going to sleep]");
+  } else {
+    LOG("NTP sync - RTC clock was off by %+lld ms", (long long)drift);
+  }
 }
 
-void laesKnapper() {
-  uint32_t nu = millis();
+// ---------------------------------------------------------------------------
+// Buttons, debounce and lock
+// ---------------------------------------------------------------------------
+void lockExpired(void*) {                     // esp_timer callback after LOCK_MS
+  if (activeLed >= 0) digitalWrite(LED_PIN[activeLed], LOW);
+  activeLed = -1;
+  lastActivity = millis();
+  locked = false;
+  LOG("Lock released - ready for next press");
+}
+
+void registerPress(int i) {
+  locked = true;
+  activeLed = i;
+  lastActivity = millis();
+  routineWake = false;   // now it is a "real" wake-up
+  for (int j = 0; j < 4; j++) digitalWrite(LED_PIN[j], j == i ? HIGH : LOW);
+  esp_timer_start_once(lockTimer, (uint64_t)LOCK_MS * 1000);
+
+  Press p = { (uint8_t)i, bootCount, millis(), timeValid() ? nowMs() : 0, false };
+  bool dropped = false;
+  portENTER_CRITICAL(&queueMux);
+  if (queueCount == QUEUE_MAX) {      // queue full: drop the oldest
+    memmove(&queue[0], &queue[1], sizeof(Press) * (QUEUE_MAX - 1));
+    queueCount--;
+    dropped = true;
+  }
+  queue[queueCount++] = p;
+  portEXIT_CRITICAL(&queueMux);
+  if (dropped) LOG("Queue full - oldest press dropped");
+  LOG("Press: %s (value %d) - locked for %lu s", NAME[i], VALUE[i], LOCK_MS / 1000);
+}
+
+void readButtons() {
+  uint32_t now = millis();
   for (int i = 0; i < 4; i++) {
-    int r = digitalRead(KNAP_PIN[i]);        // HIGH = trykket (pull-down)
-    if (r != raa[i]) {                       // signalet ændrer sig -> start forfra
-      raa[i] = r;
-      sidsteSkift[i] = nu;
-    } else if (r != stabil[i] && nu - sidsteSkift[i] >= DEBOUNCE_MS) {
-      stabil[i] = r;                         // stabilt i DEBOUNCE_MS -> accepter
+    int r = digitalRead(BUTTON_PIN[i]);      // HIGH = pressed (pull-down)
+    if (r != raw[i]) {                       // signal is changing -> start over
+      raw[i] = r;
+      lastChange[i] = now;
+    } else if (r != stable[i] && now - lastChange[i] >= DEBOUNCE_MS) {
+      stable[i] = r;                         // stable for DEBOUNCE_MS -> accept
       if (r == HIGH) {
-        if (!laast) registrerTryk(i);
-        else LOG("%s ignoreret (laast)", NAVN[i]);
+        if (!locked) registerPress(i);
+        else LOG("%s ignored (locked)", NAME[i]);
+      } else {
+        lastActivity = now;                  // release counts as activity: sleep IDLE_MS after it (test 17)
       }
     }
   }
 }
 
-void opdaterLaas() {
-  if (laast && millis() - laasStart >= LAAS_MS) {
-    laast = false;
-    digitalWrite(LED_PIN[aktivLed], LOW);
-    aktivLed = -1;
-    sidsteAktivitet = millis();
-    LOG("Laas ophaevet - klar til nyt tryk");
-  }
-}
+void pollButtons(void*) { readButtons(); }    // esp_timer callback every BUTTON_POLL_MS
 
 // ---------------------------------------------------------------------------
 // MQTT
 // ---------------------------------------------------------------------------
-bool klarTilAtSende(uint32_t session) {
-  // Tryk fra tidligere vågninger har allerede deres bedste tidsstempel.
-  // Tryk fra denne vågning venter kort på NTP, så tidsstemplet kan korrigeres.
-  return session != bootNr || ntpSynk || millis() - wifiForbundetMs >= NTP_VENT_MS;
+void mqttError() {
+  int rc = mqtt.state();
+  if (rc == MQTT_CONNECT_BAD_CREDENTIALS || rc == MQTT_CONNECT_UNAUTHORIZED) {
+    loginRejected = true;                      // the connection worked, but the login was rejected
+    LOG("MQTT login rejected (rc=%d) - check MQTT_USER/MQTT_PASSWORD. Retrying on next wake-up", rc);
+    return;
+  }
+#if USE_TLS
+  if (rc == MQTT_CONNECT_FAILED) {             // TCP/TLS failed - show the reason
+    char err[128] = "";
+    netClient.lastError(err, sizeof err);
+    LOG("MQTT error rc=%d (connection/TLS): %s", rc, err);
+    return;
+  }
+#endif
+  LOG("MQTT error rc=%d", rc);
 }
 
-bool sendTryk(const Tryk& t) {
-  int64_t ms = t.epochMs;
-  bool korrigeret = false;
-  if (t.session == bootNr && ntpSynk) {        // regn tilbage fra NTP-tid
-    ms = nuMs() - (int64_t)(millis() - t.millisVedTryk);
-    korrigeret = true;
+bool readyToSend(const Press& p) {
+  // Presses from earlier wake-ups already have their best timestamp.
+  if (p.session != bootCount || ntpSynced) return true;
+  // No clock at all (after power-on/reset): wait for NTP instead of sending "time": null (test 17).
+  // If NTP never comes, the press stays in the queue until NET_TIMEOUT_MS and is sent on the next wake-up.
+  if (p.epochMs == 0) return false;
+  // RTC time exists (after deep sleep): wait briefly for NTP so the timestamp can be corrected.
+  return millis() - wifiConnectedMs >= NTP_WAIT_MS;
+}
+
+bool sendPress(const Press& p) {
+  int64_t ms = p.epochMs;
+  bool corrected = p.ntpCorrected;
+  if (p.session == bootCount && ntpSynced) {   // calculate back from NTP time
+    ms = nowMs() - (int64_t)(millis() - p.millisAtPress);
+    corrected = true;
   }
 
   char payload[256];
   if (ms > 0) {
-    char tid[40];
-    formaterTid(ms, tid, sizeof tid);
+    char ts[40];
+    formatTime(ms, ts, sizeof ts);
     snprintf(payload, sizeof payload,
-             "{\"enhed\":\"%s\",\"knap\":\"%s\",\"vaerdi\":%d,\"tid\":\"%s\",\"epoch_ms\":%lld,\"ntp_synk\":%s}",
-             klientId, NAVN[t.knap], VAERDI[t.knap], tid, (long long)ms, korrigeret ? "true" : "false");
+             "{\"device\":\"%s\",\"button\":\"%s\",\"value\":%d,\"time\":\"%s\",\"epoch_ms\":%lld,\"ntp_synced\":%s}",
+             clientId, NAME[p.button], VALUE[p.button], ts, (long long)ms, corrected ? "true" : "false");
   } else {
     snprintf(payload, sizeof payload,
-             "{\"enhed\":\"%s\",\"knap\":\"%s\",\"vaerdi\":%d,\"tid\":null,\"epoch_ms\":null,\"ntp_synk\":false}",
-             klientId, NAVN[t.knap], VAERDI[t.knap]);
+             "{\"device\":\"%s\",\"button\":\"%s\",\"value\":%d,\"time\":null,\"epoch_ms\":null,\"ntp_synced\":false}",
+             clientId, NAME[p.button], VALUE[p.button]);
   }
-  bool ok = mqtt.publish(topicTryk, payload);
-  LOG("%s %s -> %s", ok ? "Sendt" : "FEJL", topicTryk, payload);
+  bool ok = mqtt.publish(topicPress, payload);
+  if (ok) lastActivity = millis();             // stay awake IDLE_MS after sending, so a delayed packet gets through
+  LOG("%s %s -> %s", ok ? "Sent" : "ERROR", topicPress, payload);
   return ok;
 }
 
-void toemKoe() {
-  while (koeAntal > 0 && klarTilAtSende(koe[0].session)) {
-    if (!sendTryk(koe[0])) return;             // prøv igen senere
-    memmove(&koe[0], &koe[1], sizeof(Tryk) * (koeAntal - 1));
-    koeAntal--;
+void flushQueue() {
+  for (;;) {
+    Press p;
+    portENTER_CRITICAL(&queueMux);             // copy the oldest press - new ones may arrive meanwhile
+    bool any = queueCount > 0;
+    if (any) p = queue[0];
+    portEXIT_CRITICAL(&queueMux);
+    if (!any || !readyToSend(p)) return;
+    if (!sendPress(p)) return;                 // try again later
+    portENTER_CRITICAL(&queueMux);
+    if (queueCount > 0 && memcmp(&queue[0], &p, sizeof p) == 0) {   // unless "queue full" dropped it
+      memmove(&queue[0], &queue[1], sizeof(Press) * (queueCount - 1));
+      queueCount--;
+    }
+    portEXIT_CRITICAL(&queueMux);
   }
 }
 
 void sendStatus() {
-  if (!(ntpSynk || millis() - wifiForbundetMs >= NTP_VENT_MS)) return;
-  char tid[40] = "";
-  if (tidGyldig()) formaterTid(nuMs(), tid, sizeof tid);
+  if (!(ntpSynced || millis() - wifiConnectedMs >= NTP_WAIT_MS)) return;
+  char ts[40] = "";
+  if (timeValid()) formatTime(nowMs(), ts, sizeof ts);
   char payload[256];
   snprintf(payload, sizeof payload,
-           "{\"enhed\":\"%s\",\"haendelse\":\"%s\",\"tid\":\"%s\",\"boot\":%lu,\"rssi\":%d,"
-           "\"koe\":%d,\"forrige_vaagen_ms\":%lu,\"ntp_synk\":%s,\"tls\":%s}",
-           klientId, statusHaendelse, tid, (unsigned long)bootNr, WiFi.RSSI(),
-           koeAntal, (unsigned long)forrigeVaagenMs, ntpSynk ? "true" : "false",
-           BRUG_TLS ? "true" : "false");
+           "{\"device\":\"%s\",\"event\":\"%s\",\"time\":\"%s\",\"boot\":%lu,\"rssi\":%d,"
+           "\"queue\":%d,\"prev_awake_ms\":%lu,\"ntp_synced\":%s,\"tls\":%s}",
+           clientId, statusEvent, ts, (unsigned long)bootCount, WiFi.RSSI(),
+           queueCount, (unsigned long)prevAwakeMs, ntpSynced ? "true" : "false",
+           USE_TLS ? "true" : "false");
   if (mqtt.publish(topicStatus, payload)) {
-    statusAfventer = false;
-    LOG("Status sendt -> %s", payload);
+    statusPending = false;
+    LOG("Status sent -> %s", payload);
   }
 }
 
-void haandterNetvaerk() {
+void handleNetwork() {
   if (WiFi.status() != WL_CONNECTED) {
-    wifiForbundetMs = 0;
+    wifiConnectedMs = 0;
     return;
   }
-  if (wifiForbundetMs == 0) {
-    wifiForbundetMs = millis();
-    LOG("WiFi forbundet - IP %s, RSSI %d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    if (!ntpStartet) {                        // SNTP synker igen automatisk hver time
-      configTzTime(TIDSZONE, NTP_SERVER_1, NTP_SERVER_2);
-      ntpStartet = true;
+  if (wifiConnectedMs == 0) {
+    wifiConnectedMs = millis();
+    LOG("WiFi connected - IP %s, RSSI %d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    if (!ntpStarted) {                        // SNTP re-syncs automatically every 3 h (CONFIG_LWIP_SNTP_UPDATE_DELAY)
+      configTzTime(TIMEZONE, NTP_SERVER_1, NTP_SERVER_2);
+      ntpStarted = true;
     }
   }
 
   if (!mqtt.connected()) {
-    if (sidsteMqttForsoeg != 0 && millis() - sidsteMqttForsoeg < MQTT_GENFORSOEG_MS) return;
-    sidsteMqttForsoeg = millis();
-#if BRUG_TLS
-    LOG("Forbinder til MQTT %s:%u (TLS + login) som %s ...", MQTT_VAERT, MQTT_PORT, klientId);
-    if (!mqtt.connect(klientId, MQTT_USER, MQTT_PASSWORD)) {
-      char fejl[128] = "";
-      netKlient.lastError(fejl, sizeof fejl);
-      LOG("MQTT fejl rc=%d, TLS: %s", mqtt.state(), fejl);
+    if (loginRejected) return;                // a wrong login does not get better by retrying
+    if (lastMqttAttempt != 0 && millis() - lastMqttAttempt < MQTT_RETRY_MS) return;
+    lastMqttAttempt = millis();
+#if USE_TLS
+    LOG("Connecting to MQTT %s:%u (TLS + login) as %s ...", MQTT_HOST, MQTT_PORT, clientId);
+    uint32_t t0 = millis();
+    // Open the TLS connection ourselves with a timeout (TCP + handshake, CA + host name are checked).
+    // Blocks loop() while it runs - that is OK because buttons and lock run in esp_timer.
+    // PubSubClient reuses it and only sends the MQTT login.
+    if (!netClient.connect(MQTT_HOST, MQTT_PORT, (int32_t)TLS_TIMEOUT_MS)) {
+      char err[128] = "";
+      netClient.lastError(err, sizeof err);
+      LOG("TLS connection failed after %lu ms: %s", (unsigned long)(millis() - t0), err);
+      lastMqttAttempt = millis();              // retry gap counts from the END of a slow attempt
       return;
     }
-    LOG("MQTT forbundet (TLS verificeret mod CA)");
+    uint32_t t1 = millis();
+    LOG("TLS up after %lu ms (CA verified)", (unsigned long)(t1 - t0));
+    if (!mqtt.connect(clientId, MQTT_USER, MQTT_PASSWORD)) {
+      mqttError();
+      lastMqttAttempt = millis();
+      return;
+    }
+    LOG("MQTT connected - login %lu ms, total %lu ms",
+        (unsigned long)(millis() - t1), (unsigned long)(millis() - t0));
 #else
-    LOG("Forbinder til MQTT %s:%u (UKRYPTERET, uden login) som %s ...", MQTT_VAERT, MQTT_PORT, klientId);
-    if (!mqtt.connect(klientId)) {
-      LOG("MQTT fejl rc=%d", mqtt.state());
+    LOG("Connecting to MQTT %s:%u (UNENCRYPTED, no login) as %s ...", MQTT_HOST, MQTT_PORT, clientId);
+    if (!mqtt.connect(clientId)) {
+      mqttError();
+      lastMqttAttempt = millis();
       return;
     }
-    LOG("MQTT forbundet (UKRYPTERET)");
+    LOG("MQTT connected (UNENCRYPTED)");
 #endif
   }
 
   mqtt.loop();
-  toemKoe();
-  if (statusAfventer) sendStatus();
+  flushQueue();
+  if (statusPending) sendStatus();
 }
 
 // ---------------------------------------------------------------------------
 // Deep sleep
 // ---------------------------------------------------------------------------
-uint64_t knapMaske() {
+uint64_t buttonMask() {
   uint64_t m = 0;
-  for (int i = 0; i < 4; i++) m |= 1ULL << KNAP_PIN[i];
+  for (int i = 0; i < 4; i++) m |= 1ULL << BUTTON_PIN[i];
   return m;
 }
 
-void gaaISoevn() {
-  forrigeVaagenMs = millis();
+void goToSleep() {
+  esp_timer_stop(buttonTimer);                 // no new presses from here
+  if (locked) {                                // a press arrived just before the timer stopped
+    esp_timer_start_periodic(buttonTimer, BUTTON_POLL_MS * 1000);
+    return;
+  }
+  logDrift();                                  // NTP may have arrived in this same loop() pass
+  prevAwakeMs = millis();
+  // Correct timestamps of unsent presses from this wake-up before millis() is reset
+  if (ntpSynced) {
+    for (int i = 0; i < queueCount; i++) {
+      if (queue[i].session == bootCount) {
+        queue[i].epochMs = nowMs() - (int64_t)(millis() - queue[i].millisAtPress);
+        queue[i].ntpCorrected = true;
+      }
+    }
+  }
   if (mqtt.connected()) {
     mqtt.loop();
     mqtt.disconnect();
   }
-  netKlient.stop();
-  delay(50);                                   // lad TCP nå at sende det sidste
+  netClient.stop();
+  delay(50);                                   // let TCP send the last data
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
-  esp_sleep_enable_ext1_wakeup(knapMaske(), ESP_EXT1_WAKEUP_ANY_HIGH);   // vilkårlig knap HIGH
-  esp_sleep_enable_timer_wakeup(RUTINE_SOVETID_S * 1000000ULL);
-  LOG("Deep sleep - vaagen %lu ms, %d tryk i koe. Vaagner ved tryk eller om %llu s",
-      (unsigned long)forrigeVaagenMs, koeAntal, (unsigned long long)RUTINE_SOVETID_S);
+  esp_sleep_enable_ext1_wakeup(buttonMask(), ESP_EXT1_WAKEUP_ANY_HIGH);   // any button HIGH
+  esp_sleep_enable_timer_wakeup(ROUTINE_SLEEP_S * 1000000ULL);
+  sleepStartMs  = timeValid() ? nowMs() : 0;   // for drift measurement at the next NTP sync
+  sleepStartNtp = ntpSynced;
+  LOG("Deep sleep - awake %lu ms, %d presses in queue. Wakes on press or in %llu s",
+      (unsigned long)prevAwakeMs, queueCount, (unsigned long long)ROUTINE_SLEEP_S);
   Serial.flush();
   esp_deep_sleep_start();
 }
 
-void tjekSoevn() {
-  if (laast) return;
+void checkSleep() {
+  if (locked) return;
   for (int i = 0; i < 4; i++)
-    if (raa[i] == HIGH || stabil[i] == HIGH) return;   // holdt knap ville vække straks
+    if (raw[i] == HIGH || stable[i] == HIGH) return;   // a held button would wake it immediately
 
-  uint32_t inaktiv = millis() - sidsteAktivitet;
-  if (inaktiv < (rutineVaagning ? 0 : INAKTIV_MS)) return;
+  uint32_t idle = millis() - lastActivity;
+  if (idle < (routineWake ? 0 : IDLE_MS)) return;
 
-  bool netFaerdig = koeAntal == 0 && !statusAfventer && (!rutineVaagning || ntpSynk);
-  if (!netFaerdig) {
-    if (inaktiv < NET_TIMEOUT_MS) return;
-    LOG("Net ikke faerdigt efter %lu ms - %d tryk gemmes til naeste vaagning",
-        (unsigned long)inaktiv, koeAntal);
+  bool netDone = queueCount == 0 && !statusPending && (!routineWake || ntpSynced);
+  if (!netDone) {
+    if (idle < NET_TIMEOUT_MS && !loginRejected) return;
+    LOG("Network not done after %lu ms - %d presses kept for next wake-up",
+        (unsigned long)idle, queueCount);
   }
-  gaaISoevn();
+  goToSleep();
 }
 
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  bootNr++;
-  setenv("TZ", TIDSZONE, 1);                   // TZ går tabt i deep sleep - sæt igen
+  bootCount++;
+  setenv("TZ", TIMEZONE, 1);                   // TZ is lost in deep sleep - set it again
   tzset();
+  millisAtStart = millis();
+  rtcAtStartMs  = timeValid() ? nowMs() : 0;   // RTC clock time, before NTP corrects it
+
+  const esp_timer_create_args_t lockArgs = { .callback = lockExpired, .name = "lock" };
+  esp_timer_create(&lockArgs, &lockTimer);     // must exist before the first registerPress()
+  const esp_timer_create_args_t pollArgs = { .callback = pollButtons, .name = "buttons" };
+  esp_timer_create(&pollArgs, &buttonTimer);
 
   for (int i = 0; i < 4; i++) {
-    pinMode(KNAP_PIN[i], INPUT);
+    pinMode(BUTTON_PIN[i], INPUT);
     pinMode(LED_PIN[i], OUTPUT);
-    raa[i] = stabil[i] = digitalRead(KNAP_PIN[i]);
-    sidsteSkift[i] = millis();
+    raw[i] = digitalRead(BUTTON_PIN[i]);
+    stable[i] = raw[i];
+    lastChange[i] = millis();
   }
-  sidsteAktivitet = millis();
+  lastActivity = millis();
 
   switch (esp_sleep_get_wakeup_cause()) {
     case ESP_SLEEP_WAKEUP_EXT1: {
       uint64_t m = esp_sleep_get_ext1_wakeup_status();
-      LOG("Vaagnet af knap (boot %lu)", (unsigned long)bootNr);
+      LOG("Woken by button (boot %lu)", (unsigned long)bootCount);
       for (int i = 0; i < 4; i++) {
-        if (m & (1ULL << KNAP_PIN[i])) {
-          raa[i] = stabil[i] = HIGH;           // undgå dobbelt-registrering
-          registrerTryk(i);
+        if (m & (1ULL << BUTTON_PIN[i])) {
+          raw[i] = HIGH;                       // avoid double registration
+          stable[i] = HIGH;
+          registerPress(i);
           break;
         }
       }
       break;
     }
     case ESP_SLEEP_WAKEUP_TIMER:
-      LOG("Rutine-vaagning (boot %lu)", (unsigned long)bootNr);
-      rutineVaagning = true;
-      statusAfventer = true;
-      statusHaendelse = "rutine";
+      LOG("Routine wake-up (boot %lu)", (unsigned long)bootCount);
+      routineWake = true;
+      statusPending = true;
+      statusEvent = "routine";
       break;
     default:
-      LOG("Opstart (stroem til / reset)");
-      for (int i = 0; i < 4; i++) {            // LED-test: grøn, blå, gul, rød
+      LOG("Startup (power-on / reset)");
+      for (int i = 0; i < 4; i++) {            // LED test: green, blue, yellow, red
         digitalWrite(LED_PIN[i], HIGH);
         delay(400);
         digitalWrite(LED_PIN[i], LOW);
       }
-      statusAfventer = true;
-      statusHaendelse = "opstart";
-      sidsteAktivitet = millis();
+      statusPending = true;
+      statusEvent = "startup";
+      lastActivity = millis();
       break;
   }
 
-  snprintf(klientId, sizeof klientId, "%s-%06llx", MQTT_USER,
+  snprintf(clientId, sizeof clientId, "%s-%06llx", MQTT_USER,
            (unsigned long long)(ESP.getEfuseMac() >> 24));
-  snprintf(topicTryk,   sizeof topicTryk,   "elever/%s/smiley/tryk",   MQTT_USER);
+  // "elever/<user>/" is required by the broker's ACL - students may only publish there
+  snprintf(topicPress,  sizeof topicPress,  "elever/%s/smiley/press",  MQTT_USER);
   snprintf(topicStatus, sizeof topicStatus, "elever/%s/smiley/status", MQTT_USER);
 
-#if BRUG_TLS
-  netKlient.setCACert(CA_CERT);                // ALDRIG setInsecure()
+#if USE_TLS
+  netClient.setCACert(CA_CERT);                // NEVER setInsecure()
 #endif
-  mqtt.setServer(MQTT_VAERT, MQTT_PORT);
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setBufferSize(512);
+  mqtt.setSocketTimeout(5);                    // max wait for a reply from the broker (default 15 s)
   sntp_set_time_sync_notification_cb(ntpCallback);
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);        // ikke-blokerende - knapper virker imens
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);        // non-blocking
+  esp_timer_start_periodic(buttonTimer, BUTTON_POLL_MS * 1000);   // buttons from now on
 }
 
-void loop() {
-  laesKnapper();
-  opdaterLaas();
-  haandterNetvaerk();
-  tjekSoevn();
+void loop() {                                  // buttons + lock run in esp_timer (see pollButtons)
+  logDrift();
+  handleNetwork();
+  checkSleep();
   delay(5);
 }

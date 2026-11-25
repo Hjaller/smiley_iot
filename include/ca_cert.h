@@ -1,8 +1,8 @@
 #pragma once
 
-// CA-certifikat for MQTT-brokeren wilsons (CN=MQTT-CA TEC IOT 2026, gyldigt til nov. 2036).
-// Hentet fra https://s0ren.github.io/FAG_17682_IoT_II/Features/ca.crt
-// Kun det offentlige certifikat - maa gerne committes.
+// CA certificate of the MQTT broker wilsons (CN=MQTT-CA TEC IOT 2026, valid until Nov 2036).
+// Downloaded from https://s0ren.github.io/FAG_17682_IoT_II/Features/ca.crt
+// Public certificate only - safe to commit.
 const char CA_CERT[] = R"PEM(
 -----BEGIN CERTIFICATE-----
 MIIFETCCAvmgAwIBAgIUVe6ew6dxR+2AhN1p0N5o05ZM2iYwDQYJKoZIhvcNAQEL
