@@ -81,7 +81,9 @@ Et feedback-panel som dem man kender fra lufthavne og butikker ("Happy or Not"):
 
 *LED'er med formodstand øverst, knapper med pull-down-modstand nederst, ESP32 til højre.*
 
-✏️ *Evt. diagram (fx tegnet i Fritzing/Wokwi eller i hånden).*
+![Kredsløbsdiagram](billeder/diagram.png)
+
+*Knapper fra 3V3 til GPIO med 220 Ω pull-down til GND. LED'er fra GPIO gennem 220 Ω til GND.*
 
 ---
 
@@ -641,5 +643,5 @@ Vi har brugt Claude Code til at læse opgaven, skrive og rette firmwaren, analys
 - [x] Teste knap-rettelsen (test 15b)
 - [x] Teste `IDLE_MS = 10000` (test 18)
 - [x] Foto af opstilling og screenshot af weblog
-- [ ] Evt. diagram og screenshot af seriel log
+- [x] Kredsløbsdiagram
 - [ ] Git-repo med læreren tilføjet

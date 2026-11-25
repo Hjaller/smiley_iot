@@ -41,6 +41,10 @@ Knapperne sidder på **RTC-GPIO'er**, fordi kun de kan vække ESP32 fra deep sle
 
 *LED'er med formodstand øverst, knapper med pull-down-modstand nederst, ESP32 til højre.*
 
+![Kredsløbsdiagram](billeder/diagram.png)
+
+*Knapper fra 3V3 til GPIO med 220 Ω pull-down til GND. LED'er fra GPIO gennem 220 Ω til GND.*
+
 ---
 
 ## 3. Sådan virker den
