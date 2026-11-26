@@ -153,10 +153,3 @@ Statusbeskeder (opstart og rutine) sendes til `elever/hjalte/smiley/status`.
 Vi har brugt Claude Code til at læse opgaven, skrive og rette firmwaren, analysere logs og skrive dokumentationen. Vi har selv bygget hardwaren, kørt alle tests på boardet og truffet beslutningerne.
 
 ---
-
-## 10. Mangler
-
-- [x] Foto af opstillingen
-- [x] Screenshot af weblog med de engelske beskeder
-- [x] Afsnittet om brug af AI
-- [ ] Commit og give læreren adgang til repoet
